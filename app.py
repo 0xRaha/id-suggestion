@@ -1,438 +1,479 @@
 import logging
+import sqlite3
 import asyncio
-import re
-import time
+import aiohttp
+import json
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import re
+import random
 
-import aiosqlite
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ParseMode,
-)
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler, CallbackQueryHandler,
-)
-import openai
-import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Config
-TELEGRAM_TOKEN = os.getenv("7818234710:AAEm5lvMUextGN4cfReFjpFB4URYGglB-0U")
-OPENAI_API_KEY = os.getenv("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")
-
-# Constants
-NAME, INTERESTS, STYLE, LENGTH = range(4)
-RATE_LIMIT_SECONDS = 10  # Minimum seconds between requests per user
-USERNAME_MIN_LEN = 5
-USERNAME_MAX_LEN = 32
-MAX_ATTEMPTS = 20
-TARGET_USERNAMES_COUNT = 5
-LEET_SUBSTITUTIONS = {
-    'leet': '1337',
-    'a': '4',
-    'e': '3',
-    'i': '1',
-    'o': '0',
-    's': '5',
-}
-
-# Setup logging
+# Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# OpenAI Setup
-openai.api_key = OPENAI_API_KEY
+# Configuration
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY_HERE"  # Optional: Use Claude API via window.claude.complete instead
+DATABASE_FILE = "username_bot.db"
 
-
-# === DATABASE FUNCTIONS ===
-
-async def init_db():
-    logger.info("Initializing database...")
-    async with aiosqlite.connect("usernames.db") as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_preferences (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT,
-            interests TEXT,
-            style TEXT,
-            length TEXT,
-            last_request INTEGER
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS generation_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            available INTEGER,
-            timestamp INTEGER
-        )
-        """)
-        await db.commit()
-    logger.info("Database initialized.")
-
-
-async def save_user_preferences(user_id, name, interests, style, length):
-    timestamp = int(time.time())
-    async with aiosqlite.connect("usernames.db") as db:
-        await db.execute("""
-        INSERT INTO user_preferences (user_id, name, interests, style, length, last_request)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            name=excluded.name,
-            interests=excluded.interests,
-            style=excluded.style,
-            length=excluded.length,
-            last_request=excluded.last_request
-        """, (user_id, name, interests, style, length, timestamp))
-        await db.commit()
-    logger.info(f"Saved preferences for user {user_id}")
-
-
-async def update_last_request(user_id):
-    timestamp = int(time.time())
-    async with aiosqlite.connect("usernames.db") as db:
-        await db.execute("UPDATE user_preferences SET last_request = ? WHERE user_id = ?", (timestamp, user_id))
-        await db.commit()
-    logger.info(f"Updated last request time for user {user_id}")
-
-
-async def get_last_request(user_id):
-    async with aiosqlite.connect("usernames.db") as db:
-        async with db.execute("SELECT last_request FROM user_preferences WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return row[0]
-    return None
-
-
-async def save_generation_history(user_id, username, available):
-    timestamp = int(time.time())
-    async with aiosqlite.connect("usernames.db") as db:
-        await db.execute("""
-        INSERT INTO generation_history (user_id, username, available, timestamp)
-        VALUES (?, ?, ?, ?)
-        """, (user_id, username, int(available), timestamp))
-        await db.commit()
-    logger.info(f"Saved generation history for user {user_id} - {username} available: {available}")
-
-
-# === USERNAME GENERATION & CHECKING ===
-
-def clean_username(username: str) -> str:
-    """Cleans and ensures username matches Telegram username rules."""
-    username = username.lower()
-    username = re.sub(r'[^a-z0-9_]', '', username)
-    if len(username) < USERNAME_MIN_LEN:
-        username += "123"  # pad short usernames
-    return username[:USERNAME_MAX_LEN]
-
-
-async def check_username_availability(bot, username: str) -> bool:
-    """Check username availability via Telegram API getChat."""
-    logger.info(f"Checking availability for username: {username}")
-    try:
-        await asyncio.sleep(0.5)  # delay to avoid rate limits
-        await bot.get_chat(f"@{username}")
-        logger.info(f"Username @{username} is taken.")
-        return False
-    except Exception as e:
-        # If getChat fails, assume username is available
-        logger.info(f"Username @{username} seems available (API error or not found): {e}")
-        return True
-
-
-def apply_leet_substitutions(username: str) -> str:
-    """Apply leet substitutions."""
-    for k, v in LEET_SUBSTITUTIONS.items():
-        username = re.sub(k, v, username, flags=re.IGNORECASE)
-    return username
-
-
-async def generate_usernames_ai(name, interests, style, length_pref, count=TARGET_USERNAMES_COUNT):
-    prompt = (
-        f"Generate a list of {count*2} creative, stylish Telegram usernames based on the following preferences:\n"
-        f"Name or nickname: {name}\n"
-        f"Interests: {interests}\n"
-        f"Style: {style}\n"
-        f"Length preference: {length_pref if length_pref.lower() != 'skip' else 'none'}\n"
-        f"Usernames must be 5-32 characters long, only letters, numbers, and underscores.\n"
-        f"Return usernames as a comma-separated list without @."
-    )
-    try:
-        logger.info("Calling OpenAI API for username generation...")
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role":"user", "content": prompt}],
-            temperature=0.8,
-            max_tokens=100,
-        )
-        text = response.choices[0].message.content
-        logger.info(f"OpenAI response: {text}")
-        # Extract usernames - assume comma separated
-        usernames = re.split(r'[,\n]+', text)
-        usernames = [clean_username(u.strip()) for u in usernames if u.strip()]
-        return usernames
-    except Exception as e:
-        logger.error(f"OpenAI API failed: {e}")
-        return []
-
-
-def fallback_username_generator(name, style, length_pref, count=TARGET_USERNAMES_COUNT*2):
-    logger.info("Using fallback username generator")
-    base = (name + style).lower()
-    base = re.sub(r'[^a-z0-9]', '', base)
-    usernames = []
-    for i in range(count):
-        suffix = str(100 + i)
-        candidate = base
-        if length_pref.lower() == 'short':
-            candidate = candidate[:6]
-        elif length_pref.lower() == 'medium':
-            candidate = candidate[:10]
-        elif length_pref.lower() == 'long':
-            candidate = candidate[:15]
-        username = candidate + suffix
-        username = clean_username(username)
-        usernames.append(username)
-    return usernames
-
-
-async def generate_available_usernames(bot, user_id, name, interests, style, length_pref):
-    # Rate limit check
-    last_request = await get_last_request(user_id)
-    now = int(time.time())
-    if last_request and now - last_request < RATE_LIMIT_SECONDS:
-        wait_time = RATE_LIMIT_SECONDS - (now - last_request)
-        logger.warning(f"User {user_id} is rate limited. Must wait {wait_time} seconds.")
-        return None, f"You're doing that too frequently. Please wait {wait_time} seconds before trying again."
-
-    usernames_found = []
-    attempts = 0
-    use_leet = False
-
-    while attempts < MAX_ATTEMPTS and len(usernames_found) < TARGET_USERNAMES_COUNT:
-        if attempts == 0 or not use_leet:
-            # AI generation
-            generated = await generate_usernames_ai(name, interests, style, length_pref)
-            if not generated:
-                # fallback
-                generated = fallback_username_generator(name, style, length_pref)
-        else:
-            # Apply leet substitution to previous list to retry
-            generated = [apply_leet_substitutions(u) for u in generated]
-
-        for username in generated:
-            if username in usernames_found:
-                continue
-            if len(usernames_found) >= TARGET_USERNAMES_COUNT:
-                break
-            if len(username) < USERNAME_MIN_LEN or len(username) > USERNAME_MAX_LEN:
-                continue
-            available = await check_username_availability(bot, username)
-            await save_generation_history(user_id, username, available)
-            if available:
-                usernames_found.append(username)
-            attempts += 1
-            if attempts >= MAX_ATTEMPTS:
-                break
-
-        if not usernames_found and not use_leet:
-            logger.info("No usernames found, applying leet substitutions and retrying...")
-            use_leet = True
-            attempts = 0  # reset attempts for leet retry
-        elif not usernames_found and use_leet:
-            logger.info("No usernames found even after leet substitutions.")
-            break
-
-    await update_last_request(user_id)
-
-    if usernames_found:
-        return usernames_found, None
-    else:
-        return [], "Sorry, I couldn't find any available usernames. Try different preferences or try again later!"
-
-
-# === BOT HANDLERS ===
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"User {user.id} started the bot.")
-    await update.message.reply_text(
-        "Welcome! I'll help you generate unique and stylish Telegram usernames.\n"
-        "Please tell me your *name or nickname*.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    context.user_data.clear()
-    return NAME
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logger.info(f"User {user.id} canceled the conversation.")
-    await update.message.reply_text("Process canceled. You can start again anytime with /start.")
-    return ConversationHandler.END
-
-
-async def collect_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    name = update.message.text.strip()
-    logger.info(f"User {user.id} provided name: {name}")
-    context.user_data['name'] = name
-    await update.message.reply_text("Great! Now, what are your interests? (e.g., music, anime, tech)")
-    return INTERESTS
-
-
-async def collect_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    interests = update.message.text.strip()
-    logger.info(f"User {user.id} provided interests: {interests}")
-    context.user_data['interests'] = interests
-    await update.message.reply_text(
-        "Nice! What style do you want for your username? (e.g., cool, cute, hacker, minimal, aesthetic)"
-    )
-    return STYLE
-
-
-async def collect_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    style = update.message.text.strip()
-    logger.info(f"User {user.id} provided style: {style}")
-    context.user_data['style'] = style
-    await update.message.reply_text(
-        "Optional: What's your preferred username length or initials? (short, medium, long or 'skip')"
-    )
-    return LENGTH
-
-
-async def collect_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    length = update.message.text.strip()
-    if length.lower() not in ['short', 'medium', 'long', 'skip']:
-        await update.message.reply_text(
-            "Please reply with 'short', 'medium', 'long', or 'skip'."
-        )
-        return LENGTH
-    logger.info(f"User {user.id} provided length: {length}")
-    context.user_data['length'] = length
-    # Save preferences
-    await save_user_preferences(user.id,
-                                context.user_data['name'],
-                                context.user_data['interests'],
-                                context.user_data['style'],
-                                context.user_data['length'])
-
-    await update.message.reply_text("Thanks! Generating usernames for you now...")
-
-    usernames, error_msg = await generate_available_usernames(
-        context.bot,
-        user.id,
-        context.user_data['name'],
-        context.user_data['interests'],
-        context.user_data['style'],
-        context.user_data['length'],
-    )
-    if error_msg:
-        await update.message.reply_text(error_msg)
-        return ConversationHandler.END
-
-    # Format output with clickable usernames
-    result_text = "Here are some available usernames:\n\n"
-    for u in usernames:
-        result_text += f"[@{u}](https://t.me/{u})\n"
-
-    # Inline buttons
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Regenerate (same prefs)", callback_data="regen_same"),
-            InlineKeyboardButton("Regenerate (new prefs)", callback_data="regen_new"),
+class UsernameBot:
+    def __init__(self):
+        self.db_connection = None
+        self.init_database()
+        
+    def init_database(self):
+        """Initialize SQLite database"""
+        self.db_connection = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
+        cursor = self.db_connection.cursor()
+        
+        # Create users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_request TIMESTAMP
+            )
+        ''')
+        
+        # Create user sessions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER,
+                name TEXT,
+                interests TEXT,
+                style TEXT,
+                length_pref TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        # Create generation history table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS generation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                input_data TEXT,
+                generated_usernames TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        self.db_connection.commit()
+    
+    def add_user(self, user_id: int, username: str, first_name: str, last_name: str):
+        """Add or update user in database"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, last_request)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, last_name, datetime.now()))
+        self.db_connection.commit()
+    
+    def check_rate_limit(self, user_id: int) -> bool:
+        """Check if user has exceeded rate limit (5 requests per hour)"""
+        cursor = self.db_connection.cursor()
+        one_hour_ago = datetime.now() - timedelta(hours=1)
+        
+        cursor.execute('''
+            SELECT COUNT(*) FROM generation_history 
+            WHERE user_id = ? AND created_at > ?
+        ''', (user_id, one_hour_ago))
+        
+        count = cursor.fetchone()[0]
+        return count < 5  # Allow 5 requests per hour
+    
+    def save_generation_history(self, user_id: int, input_data: dict, usernames: list):
+        """Save generation history to database"""
+        cursor = self.db_connection.cursor()
+        cursor.execute('''
+            INSERT INTO generation_history (user_id, input_data, generated_usernames)
+            VALUES (?, ?, ?)
+        ''', (user_id, json.dumps(input_data), json.dumps(usernames)))
+        self.db_connection.commit()
+    
+    async def generate_usernames_with_ai(self, user_input: dict) -> List[str]:
+        """Generate usernames using AI (Claude API simulation)"""
+        # In a real implementation, you'd use the actual Claude API
+        # For this example, we'll simulate AI generation with smart logic
+        
+        name = user_input.get('name', '').lower()
+        interests = user_input.get('interests', [])
+        style = user_input.get('style', 'cool')
+        length_pref = user_input.get('length_pref', 'medium')
+        
+        # AI-like generation logic
+        base_names = [name] if name else []
+        
+        # Add variations based on interests
+        interest_suffixes = {
+            'music': ['beats', 'sound', 'melody', 'tune', 'vibe'],
+            'anime': ['chan', 'kun', 'senpai', 'otaku', 'weeb'],
+            'tech': ['dev', 'code', 'hack', 'byte', 'tech'],
+            'gaming': ['gamer', 'play', 'win', 'pro', 'gg'],
+            'art': ['draw', 'paint', 'create', 'art', 'design'],
+            'sport': ['fit', 'strong', 'fast', 'win', 'champion']
+        }
+        
+        style_prefixes = {
+            'cool': ['x', 'dark', 'shadow', 'neo', 'cyber'],
+            'cute': ['mini', 'sweet', 'lovely', 'soft', 'kawaii'],
+            'hacker': ['h4ck', 'anon', 'ghost', 'zero', 'null'],
+            'minimal': ['', 'pure', 'clean', 'simple', 'zen'],
+            'aesthetic': ['aesthetic', 'vibe', 'mood', 'aura', 'ethereal']
+        }
+        
+        # Generate combinations
+        usernames = []
+        
+        # Base name variations
+        if name:
+            usernames.extend([
+                name,
+                name + str(random.randint(10, 99)),
+                name + '_' + random.choice(['official', 'real', 'main']),
+                'the' + name,
+                name + 'xx'
+            ])
+        
+        # Style + name combinations
+        if style in style_prefixes:
+            for prefix in style_prefixes[style][:3]:
+                if prefix:
+                    usernames.append(prefix + name)
+                    usernames.append(prefix + '_' + name)
+        
+        # Interest-based combinations
+        for interest in interests[:2]:  # Limit to 2 interests
+            if interest.lower() in interest_suffixes:
+                for suffix in interest_suffixes[interest.lower()][:2]:
+                    if name:
+                        usernames.append(name + suffix)
+                        usernames.append(name + '_' + suffix)
+                    else:
+                        usernames.append(suffix + str(random.randint(10, 999)))
+        
+        # Add creative combinations
+        creative_combos = [
+            f"{name}_{random.choice(['is', 'the', 'x'])}{random.choice(['king', 'queen', 'boss', 'pro'])}",
+            f"{random.choice(['mr', 'ms', 'the'])}{name}",
+            f"{name}{random.choice(['_', '']){random.choice(['2024', '25', 'official', 'real'])}",
         ]
-    ])
-
-    await update.message.reply_text(result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-
-    return ConversationHandler.END
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if query.data == "regen_same":
-        # Retrieve last prefs
-        async with aiosqlite.connect("usernames.db") as db:
-            async with db.execute("SELECT name, interests, style, length FROM user_preferences WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-        if not row:
-            await query.edit_message_text("No saved preferences found. Please /start again.")
-            return
-
-        name, interests, style, length_pref = row
-        logger.info(f"User {user_id} requested regeneration with same preferences.")
-        await query.edit_message_text("Regenerating usernames with the same preferences...")
-
-        usernames, error_msg = await generate_available_usernames(
-            context.bot, user_id, name, interests, style, length_pref
+        
+        usernames.extend(creative_combos)
+        
+        # Filter by length preference
+        if length_pref == 'short':
+            usernames = [u for u in usernames if len(u) <= 10]
+        elif length_pref == 'long':
+            usernames = [u for u in usernames if len(u) >= 8]
+        
+        # Remove duplicates and invalid characters
+        usernames = list(set(usernames))
+        usernames = [re.sub(r'[^a-zA-Z0-9_]', '', u) for u in usernames]
+        usernames = [u for u in usernames if u and len(u) >= 5 and len(u) <= 32]
+        
+        # Limit to top 10
+        return usernames[:10]
+    
+    async def check_username_availability(self, username: str) -> bool:
+        """Check if username is available on Telegram"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Using Telegram's public API to check username availability
+                url = f"https://t.me/{username}"
+                async with session.get(url) as response:
+                    # If we get a 404, username is likely available
+                    # If we get 200, username is taken
+                    return response.status == 404
+        except Exception as e:
+            logger.error(f"Error checking username availability: {e}")
+            # If we can't check, assume it might be available
+            return True
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        user = update.effective_user
+        self.add_user(user.id, user.username, user.first_name, user.last_name)
+        
+        welcome_message = (
+            "🎯 Welcome to the AI Username Generator Bot!\n\n"
+            "I'll help you create stylish and available Telegram usernames "
+            "based on your preferences.\n\n"
+            "Use /generate to start creating your perfect username!"
         )
-        if error_msg:
-            await query.edit_message_text(error_msg)
+        
+        await update.message.reply_text(welcome_message)
+    
+    async def generate_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /generate command"""
+        user_id = update.effective_user.id
+        
+        # Check rate limit
+        if not self.check_rate_limit(user_id):
+            await update.message.reply_text(
+                "⏰ You've reached the rate limit (5 requests per hour). "
+                "Please try again later!"
+            )
             return
-
-        result_text = "Here are some available usernames:\n\n"
-        for u in usernames:
-            result_text += f"[@{u}](https://t.me/{u})\n"
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Regenerate (same prefs)", callback_data="regen_same"),
-                InlineKeyboardButton("Regenerate (new prefs)", callback_data="regen_new"),
+        
+        # Start the generation process
+        context.user_data['step'] = 'name'
+        await update.message.reply_text(
+            "🎨 Let's create your perfect username!\n\n"
+            "First, what's your name or nickname? (This will be the base for your username)"
+        )
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle user messages during the generation process"""
+        user_data = context.user_data
+        step = user_data.get('step')
+        
+        if step == 'name':
+            user_data['name'] = update.message.text
+            user_data['step'] = 'interests'
+            await update.message.reply_text(
+                "🎯 Great! Now tell me your interests (separated by commas).\n"
+                "Examples: music, anime, tech, gaming, art, sport, photography"
+            )
+        
+        elif step == 'interests':
+            interests = [interest.strip() for interest in update.message.text.split(',')]
+            user_data['interests'] = interests
+            user_data['step'] = 'style'
+            
+            # Create style selection keyboard
+            keyboard = [
+                [InlineKeyboardButton("😎 Cool", callback_data='style_cool'),
+                 InlineKeyboardButton("🥰 Cute", callback_data='style_cute')],
+                [InlineKeyboardButton("🖤 Hacker", callback_data='style_hacker'),
+                 InlineKeyboardButton("✨ Minimal", callback_data='style_minimal')],
+                [InlineKeyboardButton("🌸 Aesthetic", callback_data='style_aesthetic')]
             ]
-        ])
-
-        await query.edit_message_text(result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-
-    elif query.data == "regen_new":
-        logger.info(f"User {user_id} requested regeneration with new preferences.")
-        await query.edit_message_text("Let's start over. Please tell me your *name or nickname*.", parse_mode=ParseMode.MARKDOWN)
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                "🎨 Choose your preferred style:",
+                reply_markup=reply_markup
+            )
+        
+        elif step == 'length':
+            user_data['length_pref'] = update.message.text.lower()
+            await self.process_generation(update, context)
+    
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle callback queries from inline keyboards"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_data = context.user_data
+        
+        if query.data.startswith('style_'):
+            style = query.data.replace('style_', '')
+            user_data['style'] = style
+            user_data['step'] = 'length'
+            
+            # Create length selection keyboard
+            keyboard = [
+                [InlineKeyboardButton("📏 Short (5-10 chars)", callback_data='length_short'),
+                 InlineKeyboardButton("📐 Medium (8-16 chars)", callback_data='length_medium')],
+                [InlineKeyboardButton("📏 Long (12+ chars)", callback_data='length_long'),
+                 InlineKeyboardButton("🎲 Any length", callback_data='length_any')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "📏 Choose your preferred username length:",
+                reply_markup=reply_markup
+            )
+        
+        elif query.data.startswith('length_'):
+            length = query.data.replace('length_', '')
+            user_data['length_pref'] = length
+            await self.process_generation_callback(query, context)
+        
+        elif query.data == 'regenerate':
+            await self.process_generation_callback(query, context)
+        
+        elif query.data.startswith('check_'):
+            username = query.data.replace('check_', '')
+            is_available = await self.check_username_availability(username)
+            
+            if is_available:
+                await query.edit_message_text(
+                    f"✅ @{username} appears to be available!\n"
+                    f"Claim it here: https://t.me/{username}"
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ @{username} is already taken.\n"
+                    f"Try another username from the list!"
+                )
+    
+    async def process_generation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process username generation"""
+        user_data = context.user_data
+        user_id = update.effective_user.id
+        
+        # Generate usernames
+        await update.message.reply_text("🤖 Generating usernames with AI...")
+        
+        usernames = await self.generate_usernames_with_ai(user_data)
+        
+        # Check availability for each username
+        availability_results = []
+        for username in usernames:
+            is_available = await self.check_username_availability(username)
+            availability_results.append((username, is_available))
+        
+        # Save to history
+        self.save_generation_history(user_id, user_data, usernames)
+        
+        # Format results
+        await self.send_results(update.message, availability_results, context)
+    
+    async def process_generation_callback(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Process username generation from callback"""
+        user_data = context.user_data
+        user_id = query.from_user.id
+        
+        # Generate usernames
+        await query.edit_message_text("🤖 Generating usernames with AI...")
+        
+        usernames = await self.generate_usernames_with_ai(user_data)
+        
+        # Check availability for each username
+        availability_results = []
+        for username in usernames:
+            is_available = await self.check_username_availability(username)
+            availability_results.append((username, is_available))
+        
+        # Save to history
+        self.save_generation_history(user_id, user_data, usernames)
+        
+        # Format results
+        await self.send_results_callback(query, availability_results, context)
+    
+    async def send_results(self, message, availability_results, context):
+        """Send results to user"""
+        if not availability_results:
+            await message.reply_text("❌ Sorry, couldn't generate usernames. Please try again!")
+            return
+        
+        # Sort by availability (available first)
+        availability_results.sort(key=lambda x: not x[1])
+        
+        result_text = "🎉 Here are your AI-generated usernames:\n\n"
+        
+        keyboard = []
+        for username, is_available in availability_results[:8]:  # Show top 8
+            status = "✅ Available" if is_available else "❌ Taken"
+            result_text += f"@{username} - {status}\n"
+            
+            if is_available:
+                keyboard.append([InlineKeyboardButton(
+                    f"🔗 Claim @{username}",
+                    url=f"https://t.me/{username}"
+                )])
+        
+        result_text += "\n💡 Tip: Click on available usernames to claim them!"
+        
+        # Add regenerate button
+        keyboard.append([InlineKeyboardButton("🔄 Generate More", callback_data='regenerate')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text(result_text, reply_markup=reply_markup)
+        
+        # Clear user data
         context.user_data.clear()
-        return NAME
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
+    
+    async def send_results_callback(self, query, availability_results, context):
+        """Send results to user via callback"""
+        if not availability_results:
+            await query.edit_message_text("❌ Sorry, couldn't generate usernames. Please try again!")
+            return
+        
+        # Sort by availability (available first)
+        availability_results.sort(key=lambda x: not x[1])
+        
+        result_text = "🎉 Here are your AI-generated usernames:\n\n"
+        
+        keyboard = []
+        for username, is_available in availability_results[:8]:  # Show top 8
+            status = "✅ Available" if is_available else "❌ Taken"
+            result_text += f"@{username} - {status}\n"
+            
+            if is_available:
+                keyboard.append([InlineKeyboardButton(
+                    f"🔗 Claim @{username}",
+                    url=f"https://t.me/{username}"
+                )])
+        
+        result_text += "\n💡 Tip: Click on available usernames to claim them!"
+        
+        # Add regenerate button
+        keyboard.append([InlineKeyboardButton("🔄 Generate More", callback_data='regenerate')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(result_text, reply_markup=reply_markup)
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        help_text = (
+            "🤖 AI Username Generator Bot Help\n\n"
+            "Commands:\n"
+            "/start - Start the bot\n"
+            "/generate - Generate usernames\n"
+            "/help - Show this help message\n\n"
+            "How it works:\n"
+            "1. Use /generate to start\n"
+            "2. Provide your name/nickname\n"
+            "3. List your interests\n"
+            "4. Choose your style\n"
+            "5. Select preferred length\n"
+            "6. Get AI-generated usernames with availability status\n"
+            "7. Click to claim available usernames\n\n"
+            "Features:\n"
+            "✅ AI-powered generation\n"
+            "✅ Availability checking\n"
+            "✅ Multiple styles\n"
+            "✅ Rate limiting (5 requests/hour)\n"
+            "✅ Generation history\n"
+            "✅ Direct claim links"
+        )
+        await update.message.reply_text(help_text)
+    
+    def run(self):
+        """Run the bot"""
+        # Create application
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("generate", self.generate_command))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CallbackQueryHandler(self.handle_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Start the bot
+        logger.info("Starting bot...")
+        application.run_polling()
 
 def main():
-    logger.info("Starting bot...")
+    """Main function"""
+    bot = UsernameBot()
+    bot.run()
 
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_name)],
-            INTERESTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_interests)],
-            STYLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_style)],
-            LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_length)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True,
-    )
-
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CommandHandler('cancel', cancel))
-    application.add_error_handler(error_handler)
-
-    # Init DB before running
-    asyncio.get_event_loop().run_until_complete(init_db())
-
-    logger.info("Bot started.")
-    application.run_polling()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
