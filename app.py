@@ -249,7 +249,7 @@ def main():
     init_db()
 
     # Replace YOUR_BOT_TOKEN with your actual bot token
-    YOUR_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    YOUR_BOT_TOKEN = "7818234710:AAEm5lvMUextGN4cfReFjpFB4URYGglB-0U"
     application = Application.builder().token(YOUR_BOT_TOKEN).build()
 
     # Conversation handler
