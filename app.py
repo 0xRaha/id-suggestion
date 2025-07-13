@@ -164,22 +164,43 @@ class UsernameBot:
     def init_telethon_client(self):
         """Initialize Telethon client for proper username checking"""
         try:
+            # Validate API credentials
+            if (TELEGRAM_API_ID == "YOUR_API_ID_HERE" or 
+                TELEGRAM_API_HASH == "YOUR_API_HASH_HERE" or 
+                not TELEGRAM_API_ID or 
+                not TELEGRAM_API_HASH):
+                logger.warning("Telegram API credentials not configured properly")
+                logger.warning("Username checking will use fallback method (less accurate)")
+                self.user_client = None
+                return
+            
+            # Convert API_ID to integer if it's a string
+            try:
+                api_id = int(TELEGRAM_API_ID)
+            except (ValueError, TypeError):
+                logger.error("TELEGRAM_API_ID must be a valid integer")
+                self.user_client = None
+                return
+            
             if TELEGRAM_SESSION_STRING and TELEGRAM_SESSION_STRING != "YOUR_SESSION_STRING_HERE":
                 # Use saved session string
                 session = StringSession(TELEGRAM_SESSION_STRING)
             else:
-                # Use file session
-                session = 'username_bot_session'
+                # Use file session - this will require phone authentication on first run
+                session = 'username_bot_user_session'
             
             self.user_client = TelegramClient(
                 session,
-                TELEGRAM_API_ID,
+                api_id,
                 TELEGRAM_API_HASH
             )
-            logger.info("Telethon client initialized successfully")
+            
+            logger.info("Telethon user client initialized successfully")
+            logger.info("Note: First run requires phone number authentication for user account")
+            
         except Exception as e:
             logger.error(f"Failed to initialize Telethon client: {e}")
-            logger.warning("Username availability checking will be disabled")
+            logger.warning("Username availability checking will use fallback method")
             self.user_client = None
     
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str):
@@ -437,11 +458,19 @@ class UsernameBot:
             
             # If no Telethon client available, fall back to less reliable method
             if not self.user_client:
-                print(f"   Warning: Using fallback method for @{username}")
                 return await self._fallback_username_check(username)
             
-            # Use proper Telegram API
-            await self.user_client.start()
+            # Ensure client is connected and authenticated as USER (not bot)
+            if not self.user_client.is_connected():
+                await self.user_client.start()
+            
+            # Verify we're authenticated as a user, not a bot
+            me = await self.user_client.get_me()
+            if me.bot:
+                logger.error("Telethon client authenticated as bot instead of user!")
+                logger.error("Please authenticate with a user account, not bot token")
+                print(f"   Error: Bot authentication detected for @{username}")
+                return await self._fallback_username_check(username)
             
             try:
                 result = await self.user_client(CheckUsernameRequest(username))
@@ -470,9 +499,16 @@ class UsernameBot:
                 self.cache_username_result(username, False)
                 return False
                 
-            except AuthKeyError:
-                print(f"   Auth error, falling back for @{username}")
-                return await self._fallback_username_check(username)
+            except Exception as api_error:
+                error_msg = str(api_error).lower()
+                if "bot users is restricted" in error_msg or "bot" in error_msg:
+                    logger.error("API method restricted for bot users - need user authentication")
+                    print(f"   Error: Bot restriction for @{username}")
+                    # Disable the client to prevent further attempts
+                    self.user_client = None
+                    return await self._fallback_username_check(username)
+                else:
+                    raise api_error
                 
         except Exception as e:
             print(f"   Error checking @{username}: {e}")
@@ -696,7 +732,7 @@ class UsernameBot:
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        api_status = "Enabled (High Accuracy)" if self.user_client else "Fallback Mode"
+        api_status = "✅ Enabled (High Accuracy)" if self.user_client else "⚠️ Fallback Mode"
         
         help_text = (
             "🤖 Enhanced AI Username Generator Bot\n\n"
@@ -744,11 +780,15 @@ class UsernameBot:
         
         if not self.user_client:
             help_text += (
-                "\n\n⚠️ Setup Note for Admin:\n"
-                "For maximum accuracy, configure:\n"
-                "• TELEGRAM_API_ID\n"
-                "• TELEGRAM_API_HASH\n"
-                "Get these from https://my.telegram.org"
+                "\n\n⚠️ ADMIN SETUP REQUIRED:\n"
+                "Bot is running in fallback mode (less accurate)\n\n"
+                "For 100% accurate results, admin needs to:\n"
+                "1. Get API credentials from https://my.telegram.org\n"
+                "2. Configure TELEGRAM_API_ID and TELEGRAM_API_HASH\n"
+                "3. Authenticate with USER account (not bot)\n"
+                "4. Restart the bot\n\n"
+                "⚠️ IMPORTANT: Must authenticate with USER account\n"
+                "Do NOT use bot token for Telethon authentication!"
             )
         
         await update.message.reply_text(help_text)
@@ -787,9 +827,35 @@ def main():
     """Main function"""
     # Check if required credentials are configured
     if TELEGRAM_API_ID == "YOUR_API_ID_HERE" or TELEGRAM_API_HASH == "YOUR_API_HASH_HERE":
-        logger.warning("Telegram API credentials not configured!")
-        logger.warning("For maximum accuracy, get API credentials from https://my.telegram.org")
+        logger.warning("=" * 60)
+        logger.warning("TELEGRAM API CREDENTIALS NOT CONFIGURED!")
+        logger.warning("For maximum accuracy, you need to:")
+        logger.warning("1. Get API credentials from https://my.telegram.org")
+        logger.warning("2. Replace YOUR_API_ID_HERE with your API ID")
+        logger.warning("3. Replace YOUR_API_HASH_HERE with your API Hash")
+        logger.warning("4. Make sure to authenticate with a USER account, not bot")
         logger.warning("Bot will run in fallback mode with reduced accuracy.")
+        logger.warning("=" * 60)
+    
+    try:
+        api_id = int(TELEGRAM_API_ID) if TELEGRAM_API_ID != "YOUR_API_ID_HERE" else 0
+    except (ValueError, TypeError):
+        logger.error("TELEGRAM_API_ID must be a valid integer!")
+        logger.error("Example: TELEGRAM_API_ID = 1234567")
+        return
+    
+    # Additional setup instructions
+    if api_id > 0:
+        logger.info("=" * 60)
+        logger.info("AUTHENTICATION SETUP:")
+        logger.info("On first run, you'll need to authenticate with your USER account")
+        logger.info("(Not the bot account - use your personal Telegram account)")
+        logger.info("You'll be prompted for:")
+        logger.info("1. Phone number (with country code)")
+        logger.info("2. Verification code from Telegram")
+        logger.info("3. Two-factor password (if enabled)")
+        logger.info("This creates a session file for future runs")
+        logger.info("=" * 60)
     
     bot = UsernameBot()
     bot.run()
@@ -798,4 +864,11 @@ if __name__ == "__main__":
     main()
 
 # Required dependencies:
-# pip install python-telegram-bot telethon aiohttp
+# pip install python-telegram-bot telethon aiohttp cryptg
+
+# SETUP INSTRUCTIONS:
+# 1. Get bot token from @BotFather
+# 2. Get API credentials from https://my.telegram.org
+# 3. Replace the configuration values above
+# 4. Run the bot and authenticate with your USER account (not bot)
+# 5. The bot will create a session file for future runs
