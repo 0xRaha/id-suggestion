@@ -307,24 +307,32 @@ class UsernameBot:
         return combinations
     
     async def generate_usernames_with_ai(self, user_input: dict) -> List[str]:
-        """Generate usernames using enhanced AI logic"""
+        """Generate usernames using enhanced AI logic - prioritizing simple formats first"""
         name = user_input.get('name', '').lower().strip()
         interests = user_input.get('interests', [])
         style = user_input.get('style', 'cool')
         length_pref = user_input.get('length_pref', 'medium')
         
-        all_usernames = set()
+        # Store usernames in priority order
+        simple_usernames = []
+        leet_usernames = []
         
-        # Base name variations
+        # Base name variations (simple format first)
         if name:
-            name_variations = self.apply_letter_replacements(name)
+            simple_usernames.extend([
+                name,
+                name + '_official',
+                name + '_real',
+                name + '_main',
+                'the' + name,
+                name + 'x',
+                name + 'xx'
+            ])
             
-            # Add base name variations
-            for variation in name_variations:
-                all_usernames.add(variation)
-                all_usernames.update(self.generate_number_combinations(variation))
+            # Add number combinations (simple format)
+            simple_usernames.extend(self.generate_number_combinations(name))
         
-        # Style-based combinations
+        # Style-based combinations (simple format first)
         if style in self.style_prefixes:
             prefixes = self.style_prefixes[style][:30]  # Limit to 30 per style
             suffixes = self.style_suffixes[style][:30]
@@ -333,33 +341,25 @@ class UsernameBot:
                 if name:
                     # Prefix + name combinations
                     base_combo = f"{prefix}{name}"
-                    all_usernames.add(base_combo)
-                    all_usernames.update(self.apply_letter_replacements(base_combo))
-                    all_usernames.update(self.generate_number_combinations(base_combo))
+                    simple_usernames.append(base_combo)
+                    simple_usernames.extend(self.generate_number_combinations(base_combo))
                     
                     # Prefix + separator + name
                     sep_combos = self.generate_separator_combinations([prefix, name])
-                    all_usernames.update(sep_combos)
-                    
-                    for combo in sep_combos:
-                        all_usernames.update(self.apply_letter_replacements(combo))
+                    simple_usernames.extend(sep_combos)
             
             for suffix in suffixes:
                 if name:
                     # Name + suffix combinations
                     base_combo = f"{name}{suffix}"
-                    all_usernames.add(base_combo)
-                    all_usernames.update(self.apply_letter_replacements(base_combo))
-                    all_usernames.update(self.generate_number_combinations(base_combo))
+                    simple_usernames.append(base_combo)
+                    simple_usernames.extend(self.generate_number_combinations(base_combo))
                     
                     # Name + separator + suffix
                     sep_combos = self.generate_separator_combinations([name, suffix])
-                    all_usernames.update(sep_combos)
-                    
-                    for combo in sep_combos:
-                        all_usernames.update(self.apply_letter_replacements(combo))
+                    simple_usernames.extend(sep_combos)
         
-        # Interest-based combinations
+        # Interest-based combinations (simple format first)
         for interest in interests[:3]:  # Limit to 3 interests
             interest_lower = interest.lower().strip()
             if interest_lower in self.interest_keywords:
@@ -376,16 +376,14 @@ class UsernameBot:
                         ]
                         
                         for combo in combos:
-                            all_usernames.add(combo)
-                            all_usernames.update(self.apply_letter_replacements(combo))
-                            all_usernames.update(self.generate_number_combinations(combo))
+                            simple_usernames.append(combo)
+                            simple_usernames.extend(self.generate_number_combinations(combo))
                     else:
                         # Pure keyword combinations
-                        all_usernames.add(keyword)
-                        all_usernames.update(self.apply_letter_replacements(keyword))
-                        all_usernames.update(self.generate_number_combinations(keyword))
+                        simple_usernames.append(keyword)
+                        simple_usernames.extend(self.generate_number_combinations(keyword))
         
-        # Creative pattern combinations
+        # Creative pattern combinations (simple format)
         if name:
             creative_patterns = [
                 f"the{name}",
@@ -421,15 +419,25 @@ class UsernameBot:
                 f"super{name}"
             ]
             
-            for pattern in creative_patterns:
-                all_usernames.add(pattern)
-                all_usernames.update(self.apply_letter_replacements(pattern))
+            simple_usernames.extend(creative_patterns)
+        
+        # NOW apply leet speak transformations to existing usernames (last priority)
+        for username in simple_usernames[:200]:  # Limit to prevent explosion
+            leet_variations = self.apply_letter_replacements(username)
+            leet_usernames.extend(leet_variations)
+        
+        # Combine in priority order: simple first, then leet speak
+        all_usernames = simple_usernames + leet_usernames
         
         # Clean and filter usernames
         cleaned_usernames = []
         for username in all_usernames:
             # Remove invalid characters and ensure lowercase - only letters, numbers, underscore allowed
             cleaned = re.sub(r'[^a-z0-9_]', '', username.lower())
+            
+            # Skip usernames that start with numbers (invalid for Telegram)
+            if cleaned and cleaned[0].isdigit():
+                continue
             
             # Check length constraints
             if 5 <= len(cleaned) <= 32:
@@ -443,8 +451,15 @@ class UsernameBot:
                 elif length_pref == 'any':
                     cleaned_usernames.append(cleaned)
         
-        # Remove duplicates and return
-        return list(set(cleaned_usernames))
+        # Remove duplicates while preserving order (simple formats first)
+        seen = set()
+        ordered_usernames = []
+        for username in cleaned_usernames:
+            if username not in seen:
+                seen.add(username)
+                ordered_usernames.append(username)
+        
+        return ordered_usernames
     
     async def check_username_availability(self, username: str) -> bool:
         """Check if username is available using proper Telegram MTProto API"""
@@ -549,9 +564,9 @@ class UsernameBot:
                     available_usernames.append(username)
                     print(f"FOUND AVAILABLE: @{username} (Total found: {len(available_usernames)})")
                     
-                    # Stop when we find 10 available usernames
-                    if len(available_usernames) >= 10:
-                        print(f"\nTARGET REACHED! Found 10 available usernames, stopping search.")
+                    # Stop when we find 30 available usernames
+                    if len(available_usernames) >= 30:
+                        print(f"\nTARGET REACHED! Found 30 available usernames, stopping search.")
                         print("=" * 60)
                         return available_usernames
                 
@@ -714,21 +729,13 @@ class UsernameBot:
         result_text = f"🎉 Found {len(available_usernames)} available usernames!\n\n"
         result_text += "✅ All usernames below are AVAILABLE:\n\n"
         
-        keyboard = []
         for i, username in enumerate(available_usernames, 1):
             result_text += f"{i}. @{username}\n"
-            keyboard.append([InlineKeyboardButton(
-                f"🔗 Claim @{username}",
-                url=f"https://t.me/{username}"
-            )])
         
-        result_text += "\n💡 Click to claim any username you like!"
+        result_text += "\n💡 Copy any username you like and set it in Telegram settings!"
+        result_text += "\n🔄 Use /generate to create more usernames"
         
-        # Add regenerate button
-        keyboard.append([InlineKeyboardButton("🔄 Generate More", callback_data='regenerate')])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(result_text, reply_markup=reply_markup)
+        await query.edit_message_text(result_text)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
@@ -742,7 +749,8 @@ class UsernameBot:
             "• 30+ prefixes/suffixes per style\n"
             "• Advanced pattern generation\n"
             "• Proper Telegram API checking\n"
-            "• Only shows AVAILABLE usernames\n"
+            "• Up to 30 available usernames per search\n"
+            "• Simple formats prioritized over leet speak\n"
             "• Smart caching system\n"
             "• No rate limits for users\n\n"
             "📝 Commands:\n"
@@ -764,7 +772,7 @@ class UsernameBot:
             "• Aesthetic: vibe, divine, ethereal\n\n"
             "🔤 Valid Characters:\n"
             "• Letters (a-z)\n"
-            "• Numbers (0-9)\n"
+            "• Numbers (0-9) - cannot start with number\n"
             "• Underscores (_)\n"
             "• 5-32 characters long\n\n"
             "🔤 Letter Replacements:\n"
@@ -775,7 +783,9 @@ class UsernameBot:
             "• Leave name empty for interest-based usernames\n"
             "• Mix multiple interests for unique results\n"
             "• Try different styles for variety\n"
-            "• All shown usernames are verified available!"
+            "• Simple formats shown first, leet speak last\n"
+            "• All shown usernames are verified available!\n"
+            "• Copy and paste any @username you like"
         )
         
         if not self.user_client:
@@ -788,7 +798,10 @@ class UsernameBot:
                 "3. Authenticate with USER account (not bot)\n"
                 "4. Restart the bot\n\n"
                 "⚠️ IMPORTANT: Must authenticate with USER account\n"
-                "Do NOT use bot token for Telethon authentication!"
+                "Do NOT use bot token for Telethon authentication!\n\n"
+                "🎯 Current: Up to 30 available usernames per generation\n"
+                "📝 Format: Simple @username text (no buttons)\n"
+                "🔤 Priority: Simple formats first, leet speak last"
             )
         
         await update.message.reply_text(help_text)
@@ -807,6 +820,8 @@ class UsernameBot:
         
         # Start the bot
         logger.info("Starting enhanced username bot...")
+        logger.info("Features: Up to 30 usernames, simple formats first, no buttons")
+        logger.info("Username validation: No leading numbers, proper Telegram format")
         
         try:
             application.run_polling()
@@ -872,3 +887,11 @@ if __name__ == "__main__":
 # 3. Replace the configuration values above
 # 4. Run the bot and authenticate with your USER account (not bot)
 # 5. The bot will create a session file for future runs
+
+# FEATURES:
+# - Up to 30 available usernames per search
+# - Simple text format (no buttons)
+# - Simple formats prioritized over leet speak
+# - Validates usernames (no leading numbers)
+# - Real-time availability checking via MTProto API
+# - 24-hour caching system for efficiency
