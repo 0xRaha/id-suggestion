@@ -206,7 +206,7 @@ class UsernameBot:
             combinations.append(f"{base}{num}")
         
         # Year patterns
-        years = [2024, 2025, 24, 25, 00, 01, 02, 03, 04, 05]
+        years = ["2024", "2025", "24", "25", "00", "01", "02", "03", "04", "05"]
         for year in years:
             combinations.append(f"{base}{year}")
         
@@ -367,12 +367,17 @@ class UsernameBot:
     async def check_username_availability(self, username: str) -> bool:
         """Check if username is available on Telegram"""
         try:
+            print(f"Checking username: @{username}")
             async with aiohttp.ClientSession() as session:
                 url = f"https://t.me/{username}"
                 async with session.get(url, timeout=5) as response:
                     # If we get a 404, username is likely available
-                    return response.status == 404
+                    is_available = response.status == 404
+                    status = "AVAILABLE" if is_available else "TAKEN"
+                    print(f"   Result: @{username} - {status}")
+                    return is_available
         except Exception as e:
+            print(f"   Error checking @{username}: {e}")
             logger.error(f"Error checking username availability for {username}: {e}")
             return True  # If we can't check, assume available
     
@@ -380,10 +385,15 @@ class UsernameBot:
         """Filter usernames to only return available ones"""
         available_usernames = []
         
+        print(f"\nStarting username availability check for {len(usernames)} generated usernames...")
+        print("=" * 60)
+        
         # Check availability in batches to avoid overwhelming the system
         batch_size = 10
         for i in range(0, len(usernames), batch_size):
             batch = usernames[i:i + batch_size]
+            
+            print(f"\nProcessing batch {i//batch_size + 1}/{(len(usernames)-1)//batch_size + 1}")
             
             # Check each username in the batch
             tasks = [self.check_username_availability(username) for username in batch]
@@ -392,14 +402,26 @@ class UsernameBot:
             for username, is_available in zip(batch, results):
                 if isinstance(is_available, bool) and is_available:
                     available_usernames.append(username)
+                    print(f"FOUND AVAILABLE: @{username} (Total found: {len(available_usernames)})")
                     
-                    # Limit to prevent too many results
-                    if len(available_usernames) >= 20:
+                    # Stop when we find 10 available usernames
+                    if len(available_usernames) >= 10:
+                        print(f"\nTARGET REACHED! Found 10 available usernames, stopping search.")
+                        print("=" * 60)
                         return available_usernames
+            
+            # If we have at least 5 and processed significant portion, we can stop early
+            # But continue if we have less than 5 to ensure minimum results
+            if len(available_usernames) >= 5 and i >= len(usernames) * 0.7:
+                print(f"\nMINIMUM MET! Found {len(available_usernames)} usernames after checking 70% of possibilities.")
+                print("=" * 60)
+                return available_usernames
             
             # Small delay between batches
             await asyncio.sleep(0.1)
         
+        print(f"\nSEARCH COMPLETE! Found {len(available_usernames)} available usernames total.")
+        print("=" * 60)
         return available_usernames
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -505,10 +527,11 @@ class UsernameBot:
         user_id = query.from_user.id
         
         # Generate usernames
-        await query.edit_message_text("🤖 Generating usernames with enhanced AI...\n⏳ This may take up to 15 seconds...")
+        await query.edit_message_text("🤖 Generating usernames with enhanced AI...\n⏳ This may take up to 5 minutes...")
         
         # Generate all possible usernames
         all_usernames = await self.generate_usernames_with_ai(user_data)
+        print(f"\nAI Generated {len(all_usernames)} unique username combinations")
         
         # Filter to only available usernames
         available_usernames = await self.filter_available_usernames(all_usernames)
@@ -528,24 +551,18 @@ class UsernameBot:
             )
             return
         
-        # Limit to top 15 results
-        top_usernames = available_usernames[:15]
-        
         result_text = f"🎉 Found {len(available_usernames)} available usernames!\n\n"
         result_text += "✅ All usernames below are AVAILABLE:\n\n"
         
         keyboard = []
-        for i, username in enumerate(top_usernames, 1):
+        for i, username in enumerate(available_usernames, 1):
             result_text += f"{i}. @{username}\n"
             keyboard.append([InlineKeyboardButton(
                 f"🔗 Claim @{username}",
                 url=f"https://t.me/{username}"
             )])
         
-        if len(available_usernames) > 15:
-            result_text += f"\n... and {len(available_usernames) - 15} more available!"
-        
-        result_text += "\n\n💡 Click to claim any username you like!"
+        result_text += "\n💡 Click to claim any username you like!"
         
         # Add regenerate button
         keyboard.append([InlineKeyboardButton("🔄 Generate More", callback_data='regenerate')])
