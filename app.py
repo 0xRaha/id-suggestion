@@ -3,6 +3,7 @@ import sqlite3
 import asyncio
 import aiohttp
 import json
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import re
@@ -307,7 +308,7 @@ class UsernameBot:
         return combinations
     
     async def generate_usernames_with_ai(self, user_input: dict) -> List[str]:
-        """Generate usernames using enhanced AI logic - prioritizing simple formats first"""
+        """Generate usernames using enhanced AI logic - prioritizing non-number formats first"""
         name = user_input.get('name', '').lower().strip()
         interests = user_input.get('interests', [])
         style = user_input.get('style', 'cool')
@@ -316,8 +317,9 @@ class UsernameBot:
         # Store usernames in priority order
         simple_usernames = []
         leet_usernames = []
+        numbered_usernames = []
         
-        # Base name variations (simple format first)
+        # Base name variations (simple format first, NO NUMBERS)
         if name:
             simple_usernames.extend([
                 name,
@@ -328,11 +330,8 @@ class UsernameBot:
                 name + 'x',
                 name + 'xx'
             ])
-            
-            # Add number combinations (simple format)
-            simple_usernames.extend(self.generate_number_combinations(name))
         
-        # Style-based combinations (simple format first)
+        # Style-based combinations (simple format first, NO NUMBERS)
         if style in self.style_prefixes:
             prefixes = self.style_prefixes[style][:30]  # Limit to 30 per style
             suffixes = self.style_suffixes[style][:30]
@@ -342,7 +341,6 @@ class UsernameBot:
                     # Prefix + name combinations
                     base_combo = f"{prefix}{name}"
                     simple_usernames.append(base_combo)
-                    simple_usernames.extend(self.generate_number_combinations(base_combo))
                     
                     # Prefix + separator + name
                     sep_combos = self.generate_separator_combinations([prefix, name])
@@ -353,13 +351,12 @@ class UsernameBot:
                     # Name + suffix combinations
                     base_combo = f"{name}{suffix}"
                     simple_usernames.append(base_combo)
-                    simple_usernames.extend(self.generate_number_combinations(base_combo))
                     
                     # Name + separator + suffix
                     sep_combos = self.generate_separator_combinations([name, suffix])
                     simple_usernames.extend(sep_combos)
         
-        # Interest-based combinations (simple format first)
+        # Interest-based combinations (simple format first, NO NUMBERS)
         for interest in interests[:3]:  # Limit to 3 interests
             interest_lower = interest.lower().strip()
             if interest_lower in self.interest_keywords:
@@ -374,16 +371,42 @@ class UsernameBot:
                             f"{name}_{keyword}",
                             f"{keyword}_{name}"
                         ]
-                        
-                        for combo in combos:
-                            simple_usernames.append(combo)
-                            simple_usernames.extend(self.generate_number_combinations(combo))
+                        simple_usernames.extend(combos)
                     else:
-                        # Pure keyword combinations
+                        # Pure keyword combinations (when no name provided)
                         simple_usernames.append(keyword)
-                        simple_usernames.extend(self.generate_number_combinations(keyword))
+                        
+                        # Add style + keyword combinations for empty names
+                        if style in self.style_prefixes:
+                            prefixes = self.style_prefixes[style][:15]  # Reduced for empty names
+                            suffixes = self.style_suffixes[style][:15]
+                            
+                            for prefix in prefixes:
+                                simple_usernames.append(f"{prefix}{keyword}")
+                                simple_usernames.append(f"{prefix}_{keyword}")
+                            
+                            for suffix in suffixes:
+                                simple_usernames.append(f"{keyword}{suffix}")
+                                simple_usernames.append(f"{keyword}_{suffix}")
         
-        # Creative pattern combinations (simple format)
+        # If no name provided, add pure style-based usernames (NO NUMBERS)
+        if not name and style in self.style_prefixes:
+            prefixes = self.style_prefixes[style][:20]
+            suffixes = self.style_suffixes[style][:20]
+            
+            # Pure prefix combinations
+            simple_usernames.extend(prefixes)
+            
+            # Pure suffix combinations  
+            simple_usernames.extend(suffixes)
+            
+            # Prefix + suffix combinations
+            for prefix in prefixes[:10]:
+                for suffix in suffixes[:10]:
+                    simple_usernames.append(f"{prefix}{suffix}")
+                    simple_usernames.append(f"{prefix}_{suffix}")
+        
+        # Creative pattern combinations (simple format, NO NUMBERS)
         if name:
             creative_patterns = [
                 f"the{name}",
@@ -421,13 +444,19 @@ class UsernameBot:
             
             simple_usernames.extend(creative_patterns)
         
-        # NOW apply leet speak transformations to existing usernames (last priority)
+        # NOW apply leet speak transformations to existing usernames (NO NUMBERS YET)
         for username in simple_usernames[:200]:  # Limit to prevent explosion
             leet_variations = self.apply_letter_replacements(username)
             leet_usernames.extend(leet_variations)
         
-        # Combine in priority order: simple first, then leet speak
-        all_usernames = simple_usernames + leet_usernames
+        # FINALLY add number combinations (LAST RESORT)
+        all_non_numbered = simple_usernames + leet_usernames
+        for username in all_non_numbered[:150]:  # Limit to prevent explosion
+            numbered_variations = self.generate_number_combinations(username)
+            numbered_usernames.extend(numbered_variations)
+        
+        # Combine in priority order: simple first, then leet speak, then numbered
+        all_usernames = simple_usernames + leet_usernames + numbered_usernames
         
         # Clean and filter usernames
         cleaned_usernames = []
@@ -547,11 +576,16 @@ class UsernameBot:
             return True
     
     async def filter_available_usernames(self, usernames: List[str]) -> List[str]:
-        """Filter usernames to only return available ones"""
+        """Filter usernames to only return available ones - guaranteed minimum 10 or exhaust all ideas"""
         available_usernames = []
         
         print(f"\nStarting username availability check for {len(usernames)} generated usernames...")
+        print("Target: Find at least 10 available usernames or check all ideas")
         print("=" * 60)
+        
+        consecutive_errors = 0
+        requests_this_batch = 0
+        batch_start_time = time.time()
         
         # Check availability with proper rate limiting for MTProto API
         for i, username in enumerate(usernames):
@@ -559,34 +593,59 @@ class UsernameBot:
             
             try:
                 is_available = await self.check_username_availability(username)
+                consecutive_errors = 0  # Reset error counter on success
+                requests_this_batch += 1
                 
                 if is_available:
                     available_usernames.append(username)
                     print(f"FOUND AVAILABLE: @{username} (Total found: {len(available_usernames)})")
-                    
-                    # Stop when we find 30 available usernames
-                    if len(available_usernames) >= 30:
-                        print(f"\nTARGET REACHED! Found 30 available usernames, stopping search.")
-                        print("=" * 60)
-                        return available_usernames
                 
-                # Delay between checks to respect rate limits
-                # MTProto API allows ~30 requests per second, so we use 2 second delay to be safe
+                # Check if we need to rest to prevent API explosion
+                if requests_this_batch >= 50:  # After 50 requests
+                    elapsed_time = time.time() - batch_start_time
+                    if elapsed_time < 120:  # If less than 2 minutes have passed
+                        rest_time = 60  # Rest for 1 minute
+                        print(f"\nAPI EXPLOSION PREVENTION: Resting for {rest_time} seconds...")
+                        print(f"Processed {requests_this_batch} requests in {elapsed_time:.1f} seconds")
+                        print(f"Rate: {requests_this_batch/elapsed_time:.1f} requests/second")
+                        await asyncio.sleep(rest_time)
+                        print("Resuming username checking...")
+                    
+                    # Reset batch counters
+                    requests_this_batch = 0
+                    batch_start_time = time.time()
+                
+                # Normal delay between checks
                 await asyncio.sleep(2.0)
                 
             except Exception as e:
                 print(f"Error checking @{username}: {e}")
-                await asyncio.sleep(5.0)  # Longer delay on errors
+                consecutive_errors += 1
+                
+                # If too many consecutive errors, take a longer break
+                if consecutive_errors >= 5:
+                    rest_time = 120  # Rest for 2 minutes on repeated errors
+                    print(f"\nERROR RECOVERY: Too many consecutive errors ({consecutive_errors}), resting for {rest_time} seconds...")
+                    print(f"This helps prevent being blocked by Telegram's rate limiting")
+                    await asyncio.sleep(rest_time)
+                    consecutive_errors = 0
+                    print("Resuming after error recovery...")
+                else:
+                    await asyncio.sleep(5.0)  # Shorter delay on single errors
                 continue
-            
-            # If we have at least 5 and processed significant portion, we can stop early
-            # But continue if we have less than 5 to ensure minimum results
-            if len(available_usernames) >= 5 and i >= len(usernames) * 0.7:
-                print(f"\nMINIMUM MET! Found {len(available_usernames)} usernames after checking 70% of possibilities.")
-                print("=" * 60)
-                return available_usernames
         
         print(f"\nSEARCH COMPLETE! Found {len(available_usernames)} available usernames total.")
+        print(f"Total usernames checked: {len(usernames)}")
+        print(f"Success rate: {len(available_usernames)/len(usernames)*100:.1f}%")
+        
+        # Check if we met the minimum requirement
+        if len(available_usernames) >= 10:
+            print(f"SUCCESS: Found {len(available_usernames)} usernames (minimum 10 achieved)")
+        elif len(available_usernames) > 0:
+            print(f"PARTIAL SUCCESS: Found {len(available_usernames)} usernames (checked all {len(usernames)} ideas)")
+        else:
+            print("NO AVAILABLE USERNAMES: All generated ideas were taken")
+        
         print("=" * 60)
         return available_usernames
     
@@ -607,7 +666,7 @@ class UsernameBot:
             "💡 Creative pattern generation\n"
             "🚀 Interest-based suggestions\n\n"
             f"📡 API Status: {api_status}\n\n"
-            "Use /generate to start creating your perfect username!"
+            "Use /generate to start with your name or /empty for interest-based usernames!"
         )
         
         if not self.user_client:
@@ -625,7 +684,18 @@ class UsernameBot:
         await update.message.reply_text(
             "🎨 Let's create your perfect username!\n\n"
             "First, what's your name or nickname? (This will be the base for your username)\n"
-            "💡 Leave empty if you want purely interest-based usernames"
+            "💡 Leave empty if you want purely interest-based usernames\n"
+            "💡 Or use /empty to skip name and go directly to interests"
+        )
+    
+    async def empty_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /empty command - skip name and go directly to interests"""
+        context.user_data['name'] = ''
+        context.user_data['step'] = 'interests'
+        await update.message.reply_text(
+            "🎯 Great! Creating usernames based purely on interests.\n\n"
+            "Tell me your interests (separated by commas).\n"
+            "Examples: music, anime, tech, gaming, art, sport, photography"
         )
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -722,18 +792,27 @@ class UsernameBot:
         if not available_usernames:
             await query.edit_message_text(
                 "😅 No available usernames found with your criteria!\n"
+                "All generated combinations were already taken.\n"
                 "Try different interests or style settings."
             )
             return
         
         result_text = f"🎉 Found {len(available_usernames)} available usernames!\n\n"
-        result_text += "✅ All usernames below are AVAILABLE:\n\n"
+        
+        if len(available_usernames) >= 10:
+            result_text += "✅ All usernames below are AVAILABLE:\n\n"
+        else:
+            result_text += f"✅ Found {len(available_usernames)} available usernames (checked all possibilities):\n\n"
         
         for i, username in enumerate(available_usernames, 1):
             result_text += f"{i}. @{username}\n"
         
         result_text += "\n💡 Copy any username you like and set it in Telegram settings!"
         result_text += "\n🔄 Use /generate to create more usernames"
+        
+        # Add note about search completeness
+        if len(available_usernames) < 10:
+            result_text += f"\n\n📝 Note: Searched all generated combinations thoroughly"
         
         await query.edit_message_text(result_text)
     
@@ -749,21 +828,23 @@ class UsernameBot:
             "• 30+ prefixes/suffixes per style\n"
             "• Advanced pattern generation\n"
             "• Proper Telegram API checking\n"
-            "• Up to 30 available usernames per search\n"
-            "• Simple formats prioritized over leet speak\n"
+            "• Guaranteed minimum 10 usernames or exhaust all ideas\n"
+            "• Priority: Simple → Leet speak → Numbers (last resort)\n"
+            "• API explosion prevention with smart rest periods\n"
             "• Smart caching system\n"
             "• No rate limits for users\n\n"
             "📝 Commands:\n"
             "/start - Start the bot\n"
-            "/generate - Generate usernames\n"
+            "/generate - Generate usernames with name input\n"
+            "/empty - Generate usernames without name (interests only)\n"
             "/help - Show this help\n\n"
             "🎯 How it works:\n"
-            "1. Provide your name/nickname (optional)\n"
+            "1. Use /generate (with name) or /empty (without name)\n"
             "2. List your interests\n"
             "3. Choose your style\n"
             "4. Select length preference\n"
-            "5. Get AI-generated AVAILABLE usernames\n"
-            "6. Click to claim instantly\n\n"
+            "5. Get minimum 10 AVAILABLE usernames (or all possibilities)\n"
+            "6. Copy and use any username you like\n\n"
             "🎨 Styles:\n"
             "• Cool: dark, cyber, pro, shadow, elite\n"
             "• Cute: kawaii, sweet, bunny, angel\n"
@@ -783,7 +864,9 @@ class UsernameBot:
             "• Leave name empty for interest-based usernames\n"
             "• Mix multiple interests for unique results\n"
             "• Try different styles for variety\n"
-            "• Simple formats shown first, leet speak last\n"
+            "• Priority: Simple → Leet speak → Numbers (last resort)\n"
+            "• Guaranteed minimum 10 usernames or all possibilities checked\n"
+            "• Bot includes rest periods to prevent API overload\n"
             "• All shown usernames are verified available!\n"
             "• Copy and paste any @username you like"
         )
@@ -799,9 +882,11 @@ class UsernameBot:
                 "4. Restart the bot\n\n"
                 "⚠️ IMPORTANT: Must authenticate with USER account\n"
                 "Do NOT use bot token for Telethon authentication!\n\n"
-                "🎯 Current: Up to 30 available usernames per generation\n"
+                "🎯 Current: Minimum 10 usernames guaranteed or exhaust all ideas\n"
                 "📝 Format: Simple @username text (no buttons)\n"
-                "🔤 Priority: Simple formats first, leet speak last"
+                "🔤 Priority: Simple → Leet speak → Numbers (last resort)\n"
+                "🛡️ Protection: Smart rest periods prevent API explosion\n"
+                "💡 Commands: /generate (with name) or /empty (without name)"
             )
         
         await update.message.reply_text(help_text)
@@ -814,14 +899,17 @@ class UsernameBot:
         # Add handlers
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("generate", self.generate_command))
+        application.add_handler(CommandHandler("empty", self.empty_command))
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CallbackQueryHandler(self.handle_callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
         # Start the bot
         logger.info("Starting enhanced username bot...")
-        logger.info("Features: Up to 30 usernames, simple formats first, no buttons")
+        logger.info("Features: Minimum 10 usernames guaranteed, simple formats first, no buttons")
         logger.info("Username validation: No leading numbers, proper Telegram format")
+        logger.info("Generation priority: Simple → Leet speak → Numbers (last resort)")
+        logger.info("API protection: Smart rest periods to prevent explosion")
         
         try:
             application.run_polling()
@@ -889,9 +977,10 @@ if __name__ == "__main__":
 # 5. The bot will create a session file for future runs
 
 # FEATURES:
-# - Up to 30 available usernames per search
+# - Guaranteed minimum 10 usernames or exhaust all ideas
 # - Simple text format (no buttons)
-# - Simple formats prioritized over leet speak
+# - Generation priority: Simple → Leet speak → Numbers (last resort)
+# - API explosion prevention with smart rest periods
 # - Validates usernames (no leading numbers)
 # - Real-time availability checking via MTProto API
 # - 24-hour caching system for efficiency
