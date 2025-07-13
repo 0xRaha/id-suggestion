@@ -576,4 +576,43 @@ class UsernameBot:
             "5. Get AI-generated AVAILABLE usernames\n"
             "6. Click to claim instantly\n\n"
             "🎨 Styles:\n"
-            "• Cool: dark, cyber, pro
+            "• Cool: dark, cyber, pro, shadow, elite\n"
+            "• Cute: kawaii, sweet, bunny, angel\n"
+            "• Hacker: anon, root, null, binary\n"
+            "• Minimal: clean, pure, simple, zen\n"
+            "• Aesthetic: vibe, divine, ethereal\n\n"
+            "🔤 Letter Replacements:\n"
+            "• o→0, i→1, l→1, z→2, b→13\n"
+            "• a→4, s→5, g→6, t→7, q→9\n\n"
+            "Example: 'noob' becomes 'n00b'\n\n"
+            "💡 Tips:\n"
+            "• Leave name empty for interest-based usernames\n"
+            "• Mix multiple interests for unique results\n"
+            "• Try different styles for variety\n"
+            "• All shown usernames are available!"
+        )
+        await update.message.reply_text(help_text)
+    
+    def run(self):
+        """Run the bot"""
+        # Create application
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("generate", self.generate_command))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CallbackQueryHandler(self.handle_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Start the bot
+        logger.info("Starting enhanced username bot...")
+        application.run_polling()
+
+def main():
+    """Main function"""
+    bot = UsernameBot()
+    bot.run()
+
+if __name__ == "__main__":
+    main()
